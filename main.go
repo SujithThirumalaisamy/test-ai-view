@@ -10,14 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
-	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 type streamHandler struct {
@@ -25,26 +22,28 @@ type streamHandler struct {
 	processedChan  chan []byte
 	done           chan struct{}
 	ffmpegStdin    io.WriteCloser
-	workerPool     chan struct{}
+	workerCount    int
 	metricsEnabled bool
 }
 
 func newStreamHandler(workers int) *streamHandler {
 	return &streamHandler{
-		rtpChan:       make(chan []byte, 100),    // Smaller buffer to reduce latency
-		processedChan: make(chan []byte, 100),    // Processed packets ready for FFmpeg
-		done:          make(chan struct{}),
-		workerPool:    make(chan struct{}, workers),
+		rtpChan:        make(chan []byte, 100), // Smaller buffer to reduce latency
+		processedChan:  make(chan []byte, 100), // Processed packets ready for FFmpeg
+		done:           make(chan struct{}),
+		workerCount:    workers,
 		metricsEnabled: true,
 	}
 }
 
 func (h *streamHandler) processRTPPackets(track *webrtc.TrackRemote) {
-	defer close(h.rtpChan)
-	
+	defer close(h.processedChan)
+
 	packetCounter := uint64(0)
 	lastMetricTime := time.Now()
-	
+
+	workers := make(chan struct{}, h.workerCount)
+
 	for {
 		select {
 		case <-h.done:
@@ -55,34 +54,37 @@ func (h *streamHandler) processRTPPackets(track *webrtc.TrackRemote) {
 				fmt.Println("Error reading RTP:", err)
 				return
 			}
-			
-			// Acquire worker
-			h.workerPool <- struct{}{}
-			
-			go func(packet *rtp.Packet, counter uint64) {
-				defer func() { <-h.workerPool }() // Release worker
-				
-				// Process packet in parallel
-				payload := make([]byte, len(packet.Payload))
-				copy(payload, packet.Payload)
-				
-				select {
-				case h.processedChan <- payload:
-					if h.metricsEnabled {
-						packetCounter++
-						if time.Since(lastMetricTime) >= time.Second {
-							fmt.Printf("Processed %d packets/sec\n", packetCounter)
-							packetCounter = 0
-							lastMetricTime = time.Now()
+
+			select {
+			case workers <- struct{}{}: // Acquire worker
+				go func(packet []byte) {
+					defer func() { <-workers }() // Release worker
+
+					// Process packet in parallel
+					payload := make([]byte, len(packet))
+					copy(payload, packet)
+
+					select {
+					case h.processedChan <- payload:
+						if h.metricsEnabled {
+							packetCounter++
+							if time.Since(lastMetricTime) >= time.Second {
+								fmt.Printf("Processed %d packets/sec\n", packetCounter)
+								packetCounter = 0
+								lastMetricTime = time.Now()
+							}
+						}
+					default:
+						if h.metricsEnabled {
+							fmt.Println("Packet dropped: buffer full")
 						}
 					}
-				default:
-					// Drop packet if buffer full
-					if h.metricsEnabled {
-						fmt.Println("Packet dropped: buffer full")
-					}
+				}(rtpPacket.Payload)
+			default:
+				if h.metricsEnabled {
+					fmt.Println("Worker pool full, dropping packet")
 				}
-			}(rtpPacket, packetCounter)
+			}
 		}
 	}
 }
@@ -90,25 +92,24 @@ func (h *streamHandler) processRTPPackets(track *webrtc.TrackRemote) {
 func (h *streamHandler) writeToFFmpeg() {
 	const batchSize = 5 // Process packets in small batches for efficiency
 	batch := make([][]byte, 0, batchSize)
-	
+
 	flushBatch := func() {
 		if len(batch) == 0 {
 			return
 		}
-		
-		// Write batch to FFmpeg
+
 		for _, payload := range batch {
 			if _, err := h.ffmpegStdin.Write(payload); err != nil {
 				fmt.Println("Error writing to FFmpeg:", err)
 				return
 			}
 		}
-		batch = batch[:0] // Clear batch
+		batch = batch[:0]
 	}
-	
-	ticker := time.NewTicker(5 * time.Millisecond) // Force flush every 5ms
+
+	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case payload, ok := <-h.processedChan:
@@ -116,14 +117,14 @@ func (h *streamHandler) writeToFFmpeg() {
 				flushBatch()
 				return
 			}
-			
+
 			batch = append(batch, payload)
 			if len(batch) >= batchSize {
 				flushBatch()
 			}
-			
+
 		case <-ticker.C:
-			flushBatch() // Force flush on timer
+			flushBatch()
 		}
 	}
 }
@@ -137,7 +138,7 @@ func (h *streamHandler) startFFmpeg() error {
 		"-i", "pipe:0",
 		"-c:a", "copy",
 		"-f", "segment",
-		"-segment_time", "0.025", // Even smaller segments
+		"-segment_time", "0.025",
 		"-segment_format", "ogg",
 		"-segment_list_flags", "+live",
 		"-segment_list_size", "2",
@@ -163,14 +164,6 @@ func (h *streamHandler) startFFmpeg() error {
 }
 
 func saveToDisk(writer io.Writer, track *webrtc.TrackRemote) {
-	packetizer := rtp.NewPacketizer(
-		1200,                         // Maximum Transmission Unit
-		0,                           // Payload Type
-		123,                         // SSRC
-		track.Codec().PayloadType,   // Payload Type
-		track.Codec().ClockRate,     // Clock Rate
-	)
-
 	for {
 		rtpPacket, _, err := track.ReadRTP()
 		if err != nil {
@@ -178,7 +171,6 @@ func saveToDisk(writer io.Writer, track *webrtc.TrackRemote) {
 			return
 		}
 
-		// Write raw RTP payload directly
 		if _, err := writer.Write(rtpPacket.Payload); err != nil {
 			fmt.Println("Error writing payload:", err)
 			return
@@ -259,9 +251,9 @@ func main() {
 		codec := track.Codec()
 		if strings.EqualFold(codec.MimeType, webrtc.MimeTypeOpus) {
 			fmt.Println("Got Opus track, starting ultra-low-latency stream")
-			
-			handler := newStreamHandler(runtime.NumCPU()) // Use number of CPU cores for worker pool
-			
+
+			handler := newStreamHandler(4) // Use 4 workers for parallel processing
+
 			if err := handler.startFFmpeg(); err != nil {
 				fmt.Println("Failed to start FFmpeg:", err)
 				return
@@ -271,13 +263,23 @@ func main() {
 			go handler.processRTPPackets(track)
 			go handler.writeToFFmpeg()
 
-			// Wait for connection to close
-			<-peerConnection.Done()
-			close(handler.done)
-			handler.ffmpegStdin.Close()
+			// Create a done channel for cleanup
+			done := make(chan struct{})
+			go func() {
+				<-done
+				close(handler.done)
+				handler.ffmpegStdin.Close()
+			}()
+
+			// Wait for peer connection to close
+			peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+				if s == webrtc.PeerConnectionStateClosed {
+					close(done)
+				}
+			})
 		} else if strings.EqualFold(codec.MimeType, webrtc.MimeTypeVP8) {
 			fmt.Println("Got VP8 track, streaming directly to FFmpeg")
-			
+
 			cmd := exec.Command(
 				"ffmpeg",
 				"-f", "rawvideo",
@@ -300,7 +302,7 @@ func main() {
 				"-segment_list_type", "m3u8",
 				"-segment_filename", "stream_%d.mp4",
 			)
-			
+
 			ffmpegStdin, err := cmd.StdinPipe()
 			if err != nil {
 				fmt.Println("Failed to create stdin pipe:", err)
