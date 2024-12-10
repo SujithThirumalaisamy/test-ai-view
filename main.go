@@ -10,29 +10,177 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
-	"github.com/pion/webrtc/v4/pkg/media/oggwriter"
 )
 
-func saveToDisk(i media.Writer, track *webrtc.TrackRemote) {
-	defer func() {
-		if err := i.Close(); err != nil {
-			panic(err)
+type streamHandler struct {
+	rtpChan        chan []byte
+	processedChan  chan []byte
+	done           chan struct{}
+	ffmpegStdin    io.WriteCloser
+	workerPool     chan struct{}
+	metricsEnabled bool
+}
+
+func newStreamHandler(workers int) *streamHandler {
+	return &streamHandler{
+		rtpChan:       make(chan []byte, 100),    // Smaller buffer to reduce latency
+		processedChan: make(chan []byte, 100),    // Processed packets ready for FFmpeg
+		done:          make(chan struct{}),
+		workerPool:    make(chan struct{}, workers),
+		metricsEnabled: true,
+	}
+}
+
+func (h *streamHandler) processRTPPackets(track *webrtc.TrackRemote) {
+	defer close(h.rtpChan)
+	
+	packetCounter := uint64(0)
+	lastMetricTime := time.Now()
+	
+	for {
+		select {
+		case <-h.done:
+			return
+		default:
+			rtpPacket, _, err := track.ReadRTP()
+			if err != nil {
+				fmt.Println("Error reading RTP:", err)
+				return
+			}
+			
+			// Acquire worker
+			h.workerPool <- struct{}{}
+			
+			go func(packet *rtp.Packet, counter uint64) {
+				defer func() { <-h.workerPool }() // Release worker
+				
+				// Process packet in parallel
+				payload := make([]byte, len(packet.Payload))
+				copy(payload, packet.Payload)
+				
+				select {
+				case h.processedChan <- payload:
+					if h.metricsEnabled {
+						packetCounter++
+						if time.Since(lastMetricTime) >= time.Second {
+							fmt.Printf("Processed %d packets/sec\n", packetCounter)
+							packetCounter = 0
+							lastMetricTime = time.Now()
+						}
+					}
+				default:
+					// Drop packet if buffer full
+					if h.metricsEnabled {
+						fmt.Println("Packet dropped: buffer full")
+					}
+				}
+			}(rtpPacket, packetCounter)
 		}
-	}()
+	}
+}
+
+func (h *streamHandler) writeToFFmpeg() {
+	const batchSize = 5 // Process packets in small batches for efficiency
+	batch := make([][]byte, 0, batchSize)
+	
+	flushBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+		
+		// Write batch to FFmpeg
+		for _, payload := range batch {
+			if _, err := h.ffmpegStdin.Write(payload); err != nil {
+				fmt.Println("Error writing to FFmpeg:", err)
+				return
+			}
+		}
+		batch = batch[:0] // Clear batch
+	}
+	
+	ticker := time.NewTicker(5 * time.Millisecond) // Force flush every 5ms
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case payload, ok := <-h.processedChan:
+			if !ok {
+				flushBatch()
+				return
+			}
+			
+			batch = append(batch, payload)
+			if len(batch) >= batchSize {
+				flushBatch()
+			}
+			
+		case <-ticker.C:
+			flushBatch() // Force flush on timer
+		}
+	}
+}
+
+func (h *streamHandler) startFFmpeg() error {
+	cmd := exec.Command(
+		"ffmpeg",
+		"-fflags", "+nobuffer+fastseek+flush_packets+discardcorrupt",
+		"-flags", "low_delay",
+		"-f", "opus",
+		"-i", "pipe:0",
+		"-c:a", "copy",
+		"-f", "segment",
+		"-segment_time", "0.025", // Even smaller segments
+		"-segment_format", "ogg",
+		"-segment_list_flags", "+live",
+		"-segment_list_size", "2",
+		"-segment_list", "stream.m3u8",
+		"-segment_format_options", "flush_packets=1",
+		"-max_delay", "0",
+		"-avoid_negative_ts", "make_zero",
+		"-segment_list_type", "m3u8",
+		"-thread_queue_size", "512",
+		"-segment_filename", "stream_%d.ogg",
+	)
+
+	var err error
+	h.ffmpegStdin, err = cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdin pipe: %v", err)
+	}
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	return cmd.Start()
+}
+
+func saveToDisk(writer io.Writer, track *webrtc.TrackRemote) {
+	packetizer := rtp.NewPacketizer(
+		1200,                         // Maximum Transmission Unit
+		0,                           // Payload Type
+		123,                         // SSRC
+		track.Codec().PayloadType,   // Payload Type
+		track.Codec().ClockRate,     // Clock Rate
+	)
 
 	for {
 		rtpPacket, _, err := track.ReadRTP()
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println("Error reading RTP:", err)
 			return
 		}
-		if err := i.WriteRTP(rtpPacket); err != nil {
-			fmt.Println(err)
+
+		// Write raw RTP payload directly
+		if _, err := writer.Write(rtpPacket.Payload); err != nil {
+			fmt.Println("Error writing payload:", err)
 			return
 		}
 	}
@@ -40,7 +188,7 @@ func saveToDisk(i media.Writer, track *webrtc.TrackRemote) {
 
 // nolint:gocognit
 func main() {
-	// Everything below is the Pion WebRTC API! Thanks for using it ❤️.
+	// Everything below is the Pion WebRTC API! Thanks for using it .
 
 	// Create a MediaEngine object to configure the supported codec
 	m := &webrtc.MediaEngine{}
@@ -106,39 +254,68 @@ func main() {
 		panic(err)
 	}
 
-	cmd := exec.Command(
-		"ffmpeg",
-		"-i", "pipe:0",
-		"-f", "mpegts",
-		"-listen", "1",
-		"http://0.0.0.0:8080",
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	ffmpegStdin, err := cmd.StdinPipe()
-	if err != nil {
-		fmt.Println("Failed to create stdin pipe: ", err)
-	}
-
-	err = cmd.Start()
-	if err != nil {
-		fmt.Println("Failed to start FFmpeg: ", err)
-	}
-
-	oggFile, err := oggwriter.NewWith(ffmpegStdin, 48000, 2)
-	if err != nil {
-		panic(err)
-	}
-
-	// Set a handler for when a new remote track starts, this handler saves buffers to disk as
-	// an ivf file, since we could have multiple video tracks we provide a counter.
-	// In your application this is where you would handle/process video
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) { //nolint: revive
+	// Set a handler for when a new remote track starts
+	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		codec := track.Codec()
 		if strings.EqualFold(codec.MimeType, webrtc.MimeTypeOpus) {
-			fmt.Println("Got Opus track, saving to disk as output.opus (48 kHz, 2 channels)")
-			saveToDisk(oggFile, track)
+			fmt.Println("Got Opus track, starting ultra-low-latency stream")
+			
+			handler := newStreamHandler(runtime.NumCPU()) // Use number of CPU cores for worker pool
+			
+			if err := handler.startFFmpeg(); err != nil {
+				fmt.Println("Failed to start FFmpeg:", err)
+				return
+			}
 
+			// Start parallel processing pipeline
+			go handler.processRTPPackets(track)
+			go handler.writeToFFmpeg()
+
+			// Wait for connection to close
+			<-peerConnection.Done()
+			close(handler.done)
+			handler.ffmpegStdin.Close()
+		} else if strings.EqualFold(codec.MimeType, webrtc.MimeTypeVP8) {
+			fmt.Println("Got VP8 track, streaming directly to FFmpeg")
+			
+			cmd := exec.Command(
+				"ffmpeg",
+				"-f", "rawvideo",
+				"-pix_fmt", "yuv420p",
+				"-s", "640x480",
+				"-r", "30",
+				"-i", "pipe:0",
+				"-c:v", "libx264",
+				"-preset", "veryfast",
+				"-tune", "zerolatency",
+				"-f", "segment",
+				"-segment_time", "0.05",
+				"-segment_format", "mp4",
+				"-segment_list_flags", "+live",
+				"-segment_list_size", "2",
+				"-segment_list", "stream.m3u8",
+				"-segment_format_options", "movflags=+frag_keyframe+empty_moov",
+				"-max_delay", "0",
+				"-avoid_negative_ts", "make_zero",
+				"-segment_list_type", "m3u8",
+				"-segment_filename", "stream_%d.mp4",
+			)
+			
+			ffmpegStdin, err := cmd.StdinPipe()
+			if err != nil {
+				fmt.Println("Failed to create stdin pipe:", err)
+				return
+			}
+
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+
+			if err := cmd.Start(); err != nil {
+				fmt.Println("Failed to start FFmpeg:", err)
+				return
+			}
+
+			saveToDisk(ffmpegStdin, track)
 		}
 	})
 
@@ -150,10 +327,6 @@ func main() {
 		if connectionState == webrtc.ICEConnectionStateConnected {
 			fmt.Println("Ctrl+C the remote client to stop the demo")
 		} else if connectionState == webrtc.ICEConnectionStateFailed || connectionState == webrtc.ICEConnectionStateClosed {
-			if closeErr := oggFile.Close(); closeErr != nil {
-				panic(closeErr)
-			}
-
 			fmt.Println("Done writing media files")
 
 			// Gracefully shutdown the peer connection
